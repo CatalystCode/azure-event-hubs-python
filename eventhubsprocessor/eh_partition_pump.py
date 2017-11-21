@@ -6,7 +6,8 @@
 import logging
 import asyncio
 from eventhubs import EventHubClient, Offset
-from eventhubs.async import AsyncReceiver
+# from eventhubs.async import AsyncReceiver
+from eventhubsprocessor.eh_pump_client import EventHubPumpClient
 from eventhubsprocessor.partition_pump import PartitionPump
 
 class EventHubPartitionPump(PartitionPump):
@@ -17,7 +18,6 @@ class EventHubPartitionPump(PartitionPump):
         PartitionPump.__init__(self, host, lease)
         self.eh_client = None
         self.partition_receiver = None
-        self.partition_receive_handler = None
 
     async def on_open_async(self):
         """
@@ -42,7 +42,7 @@ class EventHubPartitionPump(PartitionPump):
 
         if self.pump_status == "Opening":
             self.set_pump_status("Running")
-            self.eh_client.run_daemon()
+            await self.eh_client.run()
             await self.partition_receiver.run()
 
         if self.pump_status == "OpenFailed":
@@ -57,12 +57,10 @@ class EventHubPartitionPump(PartitionPump):
         """
         await self.partition_context.get_initial_offset_async()
         # Create event hub client and receive handler and set options
-        self.partition_receive_handler = AsyncReceiver(loop=self.loop)
-        self.eh_client = EventHubClient(self.host.eh_connection_string) \
-                        .subscribe(self.partition_receive_handler,
-                                   self.partition_context.consumer_group_name,
-                                   self.partition_context.partition_id,
-                                   Offset(self.partition_context.offset))
+        self.eh_client = EventHubPumpClient(self.host.eh_connection_string)
+        await self.eh_client.subscribe(self.partition_context.consumer_group_name,
+                                       self.partition_context.partition_id,
+                                       Offset(self.partition_context.offset))
         self.partition_receiver = PartitionReceiver(self)
 
     async def clean_up_clients_async(self):
@@ -71,10 +69,9 @@ class EventHubPartitionPump(PartitionPump):
         """
         if self.partition_receiver:
             if self.eh_client:
-                self.eh_client.stop()
-                self.partition_receiver = None
-                self.partition_receive_handler = None
-                self.eh_client = None
+                await self.eh_client.stop()
+            self.partition_receiver = None
+            self.eh_client = None
 
     async def on_closing_async(self, reason):
         """
@@ -99,19 +96,14 @@ class PartitionReceiver:
         while (not self.eh_partition_pump.is_closing()) \
               or self.eh_partition_pump.pump_status == "Errored":
             try:
-                if self.eh_partition_pump.partition_receive_handler:
-                    msgs = await asyncio.wait_for(self.eh_partition_pump.\
-                                                    partition_receive_handler. \
-                                                    receive(self.max_batch_size),
-                                                self.recieve_timeout,
-                                                loop=self.eh_partition_pump.loop)
+                if self.eh_partition_pump.eh_client:
+                    msgs = await asyncio.wait_for(self.eh_partition_pump.eh_client.receive(self.max_batch_size),
+                                                  self.recieve_timeout,
+                                                  loop=self.eh_partition_pump.loop)
                     await self.process_events_async(msgs)
             except asyncio.TimeoutError as err:
-                if self.eh_partition_pump.partition_receive_handler:
-                    logging.info("No events received, queue size %d, delivered %d",
-                                self.eh_partition_pump.partition_receive_handler.messages.qsize(),
-                                self.eh_partition_pump.partition_receive_handler.delivered)
                 if self.eh_partition_pump.host.eh_options.release_pump_on_timeout:
+                    logging.log("Pump timed out no new messages recieved")
                     await self.process_error_async(err)
     
     async def process_events_async(self, events):
